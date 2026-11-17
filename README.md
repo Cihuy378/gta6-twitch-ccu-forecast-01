@@ -9,7 +9,7 @@ Twitch concurrent viewers in the "Grand Theft Auto VI" category. It runs
 offline — everything it knows is in the case file, including the 38–42 past
 launches shipped as `comparables`.
 
-## Method
+## Method (round 2)
 
 **Anchor on hour 1.** Every hour is forecast as a log-ratio to the case's
 hour-1 print, so the forecast scales with whatever launch day turns out to be
@@ -20,40 +20,56 @@ the 37 comparable launches with a release-day hour 1, the correlation between
 log(hour-1 viewers) and the day's peak log-ratio is −0.94: launches whose
 hour 1 was already huge (Elden Ring 875k, Cyberpunk 2077 852k) stay near flat
 all day, while launches with a tiny hour 1 (Hollow Knight: Silksong 164,
-Kingdom Come: Deliverance II 414) explode 100–1000× by the evening. A single
-global median curve would be wrong for both ends, so each hour's median
-log-ratio is taken **locally**: a Gaussian kernel over log10(hour-1 viewers),
-bandwidth 0.45 dex, widened until the effective sample is at least 6 launches.
+Kingdom Come: Deliverance II 414) explode 100–1000× by the evening. The
+evening slope is about −2.1 log-ratio per dex of hour-1 size (R² ≈ 0.88 at
+hours 18–24) and near zero in the morning (hours 2–7), so each hour is
+fitted separately.
 
-**Console-only launches peak higher.** For the same hour-1 size, launches
-with no PC version at launch peak higher in the evening than PC launches do.
-GTA VI is console-only (PS5 + Xbox Series X|S), as are all four practice
-launches, so comparables whose console-only status matches the target's keep
-full weight and the others are down-weighted to 0.4.
+**Round 1's kernel median was biased low.** A median over ~6 effective
+launches inside a skewed size window sits below the true conditional median
+— on practice, the 50% quantile was breached only 22% of the time and the
+evening median ran 0.3–1.0 log units low. Round 2 replaces it with an
+ensemble of two estimators, blended 60/40 in log space (geometric mean of
+the quantiles):
 
-**Contaminated launches are halved, not trusted.** Each comparable carries a
-Tier annotation in its unlock note. Nine launches are
+1. **Local linear (60%).** For each hour, a kernel-weighted least squares
+   fit of log-ratio on log10(hour-1 viewers), evaluated at the target's
+   hour-1 size — the regression uses the −0.94 size structure instead of
+   fighting it. The intercept is re-centred on the weighted mean so the
+   slope cap (±3/dex) cannot shift the level, and a **curvature
+   correction** adds back the bias a local-linear fit incurs on a convex
+   curve: half the global quadratic coefficient for that hour times the
+   kernel window's weighted variance of log-size.
+2. **Peak + shape (40%).** The evening peak ratio is fitted by the same
+   local-linear machinery, and each hour's offset below the peak is a
+   kernel-weighted median across launches. This keeps the coherent daily
+   shape — the hour-5 US-unlock jump, the evening peak at hours 18–21 —
+   that per-hour fits can blur.
+
+Both share the kernel (Gaussian over log10(hour-1 viewers), bandwidth
+0.6 dex, widened until the effective sample is at least 6 launches), the
+platform weight (0.4 for a console-only mismatch — GTA VI is console-only,
+as are all four practice launches) and the tier weight (see below).
+
+**Contaminated launches are quartered, not halved.** Each comparable
+carries a Tier annotation in its unlock note. Nine launches are
 `early-access-contaminated` — they peaked days before their standard release
 day, so their release-day curves are flat and drag a clean launch's median
-down — and two are `weak` analogues (free-to-play / slow-burn). Those
-eleven are down-weighted to 0.5; the 26 clean comparables keep full weight.
-The weight is read from the case file at run time, never hard-coded per
-game, and an unannotated comparable is treated as clean. This is the one
-revision after the first build: it fixes the diagnosis that the forecast's
-median sat systematically low in the evening (the 50% quantile was breached
-only 22% of the time on practice). Validated on the target-like subsets —
-practice, leave-one-out over clean launches, and over clean big launches —
-it improves all three, while leave-one-out over all 37 launches is
-unchanged (0.385 → 0.386); it only scores worse on contaminated targets,
-whose flat release days a clean-shape model is *supposed* to overshoot.
+down — and two are `weak` analogues (free-to-play / slow-burn). Round 1
+down-weighted those eleven to 0.5; round 2 found 0.25 better on practice
+(local-linear estimator: 0.179 → 0.173) and on the leave-one-out
+guardrails (clean-big 0.186 → 0.183, clean-big console-only 0.153 →
+0.143). The weight is read from the case file at run time, never
+hard-coded per game, and an unannotated comparable is treated as clean.
 
-**Honest spreads.** The spread is the local interquartile range of the same
-kernel weights (σ = IQR / 1.349, floored at 0.25, capped at 1.4), plus 0.15
-per dex the target's hour 1 sits outside the training range — an unusually
-huge launch day gets honestly wider quantiles. The median curve is lightly
-smoothed across neighbouring hours (weight 0.5) so one noisy hour cannot spike
-the forecast; the real structure survives (the hour-5 US-unlock jump, the
-evening peak at hours 18–21, the overnight dip at hours 3–4 and 9–12).
+**Calibrated spreads.** The spread is the weighted residual SD around the
+local fit (local linear) or the peak-plus-shape uncertainties combined in
+quadrature (peak + shape), floored at 0.25, capped at 1.4, plus 0.15 per dex
+the target's hour 1 sits outside the training range — then **scaled by
+0.7**. The raw residual SD overstates the conditional spread (it mixes
+launches far across the kernel window); 0.7 is the scale that minimises
+pinball loss on the practice cases and on leave-one-out big launches alike.
+The median curve is lightly smoothed across neighbouring hours (weight 0.5).
 
 **Fallbacks.** If a case ships fewer than 5 usable comparables, the program
 falls back to the house baseline (persistence with a widening random-walk
@@ -67,26 +83,41 @@ Practice answers were taken from the same source the kit names
 cases exactly). Pinball loss is the competition's own score — mean pinball
 loss on the log scale over every hour and quantile, lower is better.
 
-| Model | Practice (4 cases) | Leave-one-out (37 launches) | LOO, big launches (hour-1 > 100k) |
-|---|---|---|---|
-| House baseline (starter) | 0.387 | 0.930 | 0.261 |
-| Global median curve | 0.310 | 0.793 | 0.346 |
-| First build (kernel + platform) | 0.216 | 0.385 | 0.215 |
-| **This entry (kernel + platform + tier weight)** | **0.209** | **0.386** | **0.190** |
+| Model | Practice (4 cases) | LOO clean (26) | LOO clean-big (10) | LOO clean-big console-only (3) |
+|---|---|---|---|---|
+| House baseline (starter) | 0.387 | — | 0.261 | — |
+| Round 1 (kernel median + tier 0.5) | 0.209 | 0.434 | 0.190 | 0.166 |
+| Round 2 local linear only | 0.151 | 0.426 | 0.179 | 0.128 |
+| Round 2 peak + shape only | 0.150 | 0.491 | 0.190 | 0.120 |
+| **Round 2 ensemble (this entry)** | **0.145** | **0.435** | **0.179** | **0.119** |
 
-Per practice case, this entry: Wolverine 0.352, Red Dead Redemption 2 0.165,
-God of War Ragnarök 0.139, Spider-Man 2 0.182 (baseline: 0.744 / 0.287 /
-0.215 / 0.303). 90% coverage on practice is 0.89 (honest ≈ 0.9); typical
-median miss ≈ 40% vs the baseline's 90%. On the target-like subsets the
-revision also helps: leave-one-out over clean launches 0.442 → 0.434, over
-clean big launches 0.210 → 0.190, over clean console-only launches
-0.195 → 0.188.
+Per practice case, this entry: Wolverine 0.159, Red Dead Redemption 2
+0.151, God of War Ragnarök 0.100, Spider-Man 2 0.170 (round 1: 0.352 /
+0.165 / 0.139 / 0.182). 90% coverage on practice is 0.95; the median's mean
+absolute log-error is 0.23 (round 1: 0.32). The biggest single gain is
+Wolverine (0.352 → 0.159): the smallest practice launch, where the kernel
+median was most biased.
+
+Ideas tested and rejected (each measured on practice + the leave-one-out
+subsets): local quadratic fits (variance beats the curvature gain),
+global quadratic fits, empirical residual quantiles instead of a normal
+spread, k-nearest-neighbour whole curves, unlock-hour alignment of the
+early hours, pre-launch diurnal profiles and pre-launch evening levels as
+extra features (correlations ≈ 0 with the size-removed peak residual),
+and lower-tail-only sigma tightening (helps practice, hurts leave-one-out).
+The final target is a huge clean console-only launch, so the
+leave-one-out clean-big and clean-big console-only subsets are the
+guardrails that matter — both improve over round 1, while leave-one-out
+over all clean launches is unchanged (0.434 → 0.435).
 
 Sanity check on the final's shape: if GTA VI's hour 1 prints 500,000
-viewers, the entry forecasts a median dip to ~0.53× by hour 10, rising to a
-~1.32× evening peak at hour 20 (median ≈ 658k, 90% interval ≈ 230k–1.88M),
-and ~1.17× at hour 24. A 1,000,000 hour 1 flattens the day further (peak
-≈ 1.19×) — the saturation the kernel learns from Elden Ring and Cyberpunk.
+viewers, the entry forecasts a median dip to ~0.59× by hour 8, rising to a
+~1.16× evening peak at hour 18 (median ≈ 581k), and ~0.93× at hour 24. A
+1,500,000 hour 1 — beyond the largest comparable (Elden Ring, 875k) —
+flattens further (median peak ≈ 1.19M at hour 18, ~0.79× hour 1) with
+honestly wider quantiles from the extrapolation term: the saturation the
+local-linear fit learns from Elden Ring and Cyberpunk, extrapolated
+smoothly rather than clipped.
 
 ## Run it
 
@@ -95,4 +126,4 @@ mkdir -p out && MAKEFUN_INPUT_DIR=<kit>/input MAKEFUN_OUTPUT_DIR=out node main.t
 ```
 
 Deterministic: two runs on the same input write identical bytes. Runtime is
-well under the 8-second cap (tens of milliseconds on the practice cases).
+well under the 8-second cap (about 0.1 s per case on the practice set).

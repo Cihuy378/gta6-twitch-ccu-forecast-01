@@ -1,46 +1,51 @@
 // gta6-twitch-ccu-forecast-01 — forecast GTA VI's launch-day Twitch viewers, hour by hour.
 // Node 22, standard library only. Runs offline: everything it knows is in the case file.
 //
-// Method (fitted and validated on the kit's practice cases and on the comparables
-// the cases ship — see README.md for the numbers):
-//   * Anchor on the case's hour-1 print p1. Every other hour is forecast as a
-//     log-ratio to p1, so the forecast scales with whatever launch day turns out
-//     to be and the log-scale pinball loss is scale-free.
-//   * For each hour h = 2..24, take every comparable launch's own release-day
-//     log-ratio ln(viewers_h / viewers_1). The median of those ratios is a
-//     strongly size-dependent curve: launches whose hour 1 was already huge
-//     (Elden Ring, Cyberpunk 2077) stay near flat all day, while launches with
-//     a tiny hour 1 explode 10-1000x by the evening (corr(log hour-1, peak
-//     ratio) ≈ -0.94 across the 37 launches). So the median is taken locally:
-//     a Gaussian kernel over log10(hour-1 viewers), bandwidth 0.45 dex,
-//     widened until the effective sample is at least 6 launches.
-//   * Console-only launches (no PC at launch) peak higher for the same hour-1
-//     size than PC launches do — GTA VI is console-only, as are all four
-//     practice launches — so comparables whose console-only status matches the
-//     target's keep full weight and the others are down-weighted to 0.4.
-//   * Each comparable carries a Tier annotation in its unlock note
-//     (comparable / early-access-contaminated / weak). Early-access launches
-//     peaked days before their standard release day, so their release-day
-//     curves are flat and drag a clean launch's median down; free-to-play
-//     and slow-burn launches are weak analogues for a paid single-player
-//     AAA launch. Non-clean tiers are therefore down-weighted to 0.5 —
-//     halved, not dropped, so the local sample stays large. GTA VI is a
-//     clean launch, as are all four practice launches. (Validated: practice
-//     0.216 -> 0.209, leave-one-out over clean launches 0.442 -> 0.434,
-//     over clean big launches 0.210 -> 0.190.)
-//   * The spread is the local interquartile range of the same kernel weights
-//     (sigma = IQR / 1.349, floored at 0.25, capped at 1.4), plus 0.15 per dex
-//     the target's hour-1 sits outside the training range, so an unusually
-//     huge launch day gets honestly wider quantiles.
-//   * The median curve is lightly smoothed across neighbouring hours (weight
-//     0.5) so one noisy hour cannot spike the forecast; the real structure
-//     (the hour-5 US unlock jump, the evening peak at hours 18-21) survives.
-//   * Quantiles: q_tau = p1 * exp(median_h + z_tau * sigma_h), z from the
-//     standard normal at the case's levels, rounded to 2 decimals.
-//   * If the case ships no usable comparables, fall back to the house
-//     baseline (persistence with a widening random-walk spread), so the
-//     output is always a valid forecast. A case that fails any other way
-//     falls back to flat persistence (every quantile = hour 1's print).
+// Round-2 method (validated on the kit's practice cases and leave-one-out over
+// the comparables — see README.md for the numbers):
+//
+// The shipped round-1 forecaster took a kernel-weighted MEDIAN log-ratio per
+// hour. That median is biased low: the launch-size distribution inside the
+// kernel window is skewed, the size curve is convex, and a median of ~6
+// effective launches is noisy. Round 2 replaces it with an ensemble of two
+// estimators, blended 60/40 in log space:
+//
+//   (1) LOCAL LINEAR (60%). For each hour h = 2..24, a kernel-weighted least
+//       squares fit of log-ratio on log10(hour-1 viewers), evaluated at the
+//       target's hour-1 size. The size slope is steep in the evening
+//       (about -2.1 per dex, R^2 ~0.88) and ~0 in the morning, so the fit
+//       adapts per hour instead of assuming one shape. A curvature
+//       correction adds back the bias a local-linear fit incurs on a convex
+//       curve: half the global quadratic coefficient times the kernel
+//       window's weighted variance of log-size. The spread is the weighted
+//       residual SD around the local fit, scaled by 0.7 — the raw residual
+//       SD overstates the conditional spread (it mixes launches far across
+//       the window), and 0.7 is the scale that minimises pinball loss on
+//       both the practice cases and leave-one-out big launches.
+//   (2) PEAK + SHAPE (40%). The evening peak ratio is fitted by the same
+//       local-linear machinery, and each hour's offset below the peak
+//       (log-ratio minus peak ratio) is taken as a kernel-weighted median
+//       across launches. This preserves the coherent daily shape — the
+//       hour-5 US-unlock jump, the evening peak at hours 18-21 — that
+//       per-hour fits can blur. Its spread combines the peak uncertainty
+//       and the shape IQR in quadrature, also scaled by 0.7.
+//
+// Both estimators share the kernel (Gaussian over log10(hour-1 viewers),
+// bandwidth 0.6 dex, widened until the effective sample is at least 6),
+// the platform weight (0.4 for a console-only mismatch) and the tier weight
+// (non-clean tiers — early-access-contaminated or weak analogues —
+// down-weighted to 0.25; halving was not enough, the contaminated launches
+// peak days before release day and drag the evening down).
+//
+// Anchor: the case's hour-1 print p1. Every other hour is forecast as a
+// log-ratio to p1, so the forecast scales with whatever launch day turns
+// out to be and the log-scale pinball loss is scale-free. The median curve
+// is lightly smoothed across neighbouring hours (weight 0.5).
+//
+// If the case ships no usable comparables, fall back to the house baseline
+// (persistence with a widening random-walk spread), so the output is always
+// a valid forecast. A case that fails any other way falls back to flat
+// persistence (every quantile = hour 1's print).
 //
 // The program reads every <id>.in in the input directory (MAKEFUN_INPUT_DIR
 // or /input) and writes <id>.out beside it in the output directory
@@ -56,21 +61,28 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 /** The levels this competition scores, in the order each row lists them. */
 const DEFAULT_LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 /** Kernel bandwidth over log10(hour-1 viewers), in dex. */
-const BANDWIDTH = 0.45;
+const BANDWIDTH = 0.6;
 /** Minimum effective sample size before the kernel widens. */
 const MIN_EFFECTIVE_N = 6;
 /** Weight of a comparable whose console-only status differs from the target's. */
 const PLATFORM_MISMATCH_WEIGHT = 0.4;
 /** Weight of a comparable whose Tier is not "comparable" (early-access
- *  contaminated or weak analogue). Halved, not dropped. */
-const NON_CLEAN_TIER_WEIGHT = 0.5;
-/** Floor and cap of the log-spread sigma. */
+ *  contaminated or weak analogue). */
+const NON_CLEAN_TIER_WEIGHT = 0.25;
+/** Floor and cap of the log-spread sigma (before the 0.7 scale). */
 const SIGMA_FLOOR = 0.25;
 const SIGMA_CAP = 1.4;
+/** Scale applied to every sigma: the raw residual SD overstates the
+ *  conditional spread; 0.7 minimises pinball loss on practice + LOO. */
+const SIGMA_SCALE = 0.7;
 /** Extra spread per dex the target sits outside the training range. */
 const EXTRAPOLATION_SPREAD = 0.15;
 /** Weight of a neighbouring hour when smoothing the median curve. */
 const SMOOTH_WEIGHT = 0.5;
+/** Cap on the fitted size slope (per dex), to bound extrapolation. */
+const SLOPE_CAP = 3;
+/** Blend weight of the local-linear estimator (peak+shape gets the rest). */
+const LOCAL_LINEAR_WEIGHT = 0.6;
 /** Spread of the fallback baseline, in log units per square-root hour. */
 const FALLBACK_SIGMA = 0.15;
 
@@ -123,6 +135,8 @@ interface LaunchCurve {
   tier: string;
   /** log(viewers_h / viewers_1) for h = 2..24, null where the hour is missing. */
   logRatios: Array<number | null>;
+  /** Peak log-ratio over the day, null when no hour is present. */
+  peak: number | null;
 }
 
 /**
@@ -176,6 +190,43 @@ function weightedQuantile(pairs: Array<[number | null, number]>, q: number): num
   return sorted[sorted.length - 1][0];
 }
 
+/**
+ * Weighted least squares for a small design (2 or 3 columns): solves
+ * (X'WX) beta = X'Wy by Gaussian elimination with partial pivoting.
+ * Returns null when the system is singular (caller falls back).
+ */
+function weightedLeastSquares(rows: number[][], ys: number[], ws: number[]): number[] | null {
+  const k = rows[0].length;
+  const a: number[][] = Array.from({ length: k }, () => Array(k).fill(0));
+  const b: number[] = Array(k).fill(0);
+  for (let i = 0; i < rows.length; i++) {
+    for (let r = 0; r < k; r++) {
+      b[r] += ws[i] * rows[i][r] * ys[i];
+      for (let c = 0; c < k; c++) a[r][c] += ws[i] * rows[i][r] * rows[i][c];
+    }
+  }
+  const m = a.map((row, i) => [...row, b[i]]);
+  for (let col = 0; col < k; col++) {
+    let piv = col;
+    for (let r = col + 1; r < k; r++) if (Math.abs(m[r][col]) > Math.abs(m[piv][col])) piv = r;
+    if (Math.abs(m[piv][col]) < 1e-12) return null;
+    const tmp = m[col];
+    m[col] = m[piv];
+    m[piv] = tmp;
+    for (let r = col + 1; r < k; r++) {
+      const f = m[r][col] / m[col][col];
+      for (let c = col; c <= k; c++) m[r][c] -= f * m[col][c];
+    }
+  }
+  const beta: number[] = Array(k).fill(0);
+  for (let r = k - 1; r >= 0; r--) {
+    let s = m[r][k];
+    for (let c = r + 1; c < k; c++) s -= m[r][c] * beta[c];
+    beta[r] = s / m[r][r];
+  }
+  return beta;
+}
+
 /** A launch is console-only when its platforms list has no PC version. */
 function isConsoleOnly(platforms?: string): boolean {
   return typeof platforms === 'string' && platforms.length > 0 && !/PC/i.test(platforms);
@@ -201,78 +252,248 @@ function extractCurves(c: CaseFile): LaunchCurve[] {
       const v = byHour.get(h);
       logRatios.push(v !== undefined && v > 0 ? Math.log(v / v1) : null);
     }
-    curves.push({ v1, consoleOnly: isConsoleOnly(comp.platforms), tier: tierOf(comp.unlock), logRatios });
+    const present = logRatios.filter((r): r is number => r !== null);
+    curves.push({
+      v1,
+      consoleOnly: isConsoleOnly(comp.platforms),
+      tier: tierOf(comp.unlock),
+      logRatios,
+      peak: present.length > 0 ? Math.max(...present) : null,
+    });
   }
   return curves;
 }
 
-/** The house baseline: persistence with a widening random-walk spread. */
-function baselineQuantiles(p1: number, hour: number, z: number[]): number[] {
-  return z.map((zi) => Math.max(1, round2(p1 * Math.exp(zi * FALLBACK_SIGMA * Math.sqrt(hour - 1)))));
+/** Effective sample size of a weight vector: (sum w)^2 / sum w^2. */
+function effectiveN(ws: number[]): number {
+  const sw = ws.reduce((s, w) => s + w, 0);
+  const sw2 = ws.reduce((s, w) => s + w * w, 0);
+  return (sw * sw) / Math.max(sw2, 1e-12);
+}
+
+/** Non-kernel weights: platform match and Tier, per comparable. */
+function baseWeights(curves: LaunchCurve[], targetConsoleOnly: boolean | null): number[] {
+  return curves.map((c) => {
+    const platform = targetConsoleOnly === null || c.consoleOnly === targetConsoleOnly ? 1 : PLATFORM_MISMATCH_WEIGHT;
+    const tier = c.tier === 'comparable' || c.tier === 'unknown' ? 1 : NON_CLEAN_TIER_WEIGHT;
+    return platform * tier;
+  });
 }
 
 /**
- * The kernel forecast for one case: for each forecast hour, a locally
- * weighted median log-ratio and an IQR-based spread around it.
+ * Kernel weights at bandwidth bw, widened until the effective sample is at
+ * least MIN_EFFECTIVE_N (or bw exceeds 3 dex).
  */
-function kernelForecast(p1: number, curves: LaunchCurve[], targetConsoleOnly: boolean | null, z: number[]): Array<{ hour: number; q: number[] }> {
-  const x0 = Math.log10(Math.max(1, p1));
-  const xs = curves.map((c) => Math.log10(c.v1));
-  const xmin = Math.min(...xs);
-  const xmax = Math.max(...xs);
-  const medians: number[] = [];
-  const sigmas: number[] = [];
-
-  for (let h = 2; h <= 24; h++) {
-    let bw = BANDWIDTH;
-    let pairs: Array<[number | null, number]> = [];
-    for (let attempt = 0; attempt < 8; attempt++) {
-      pairs = curves.map((c) => {
-        const kernel = Math.exp(-0.5 * ((Math.log10(c.v1) - x0) / bw) ** 2);
-        const platform =
-          targetConsoleOnly === null || c.consoleOnly === targetConsoleOnly ? 1 : PLATFORM_MISMATCH_WEIGHT;
-        const tier = c.tier === 'comparable' || c.tier === 'unknown' ? 1 : NON_CLEAN_TIER_WEIGHT;
-        return [c.logRatios[h - 2], kernel * platform * tier] as [number | null, number];
-      });
-      const sw = pairs.reduce((s, [, w]) => s + w, 0);
-      const sw2 = pairs.reduce((s, [, w]) => s + w * w, 0);
-      const effectiveN = (sw * sw) / Math.max(sw2, 1e-12);
-      if (effectiveN >= MIN_EFFECTIVE_N || bw > 3) break;
-      bw *= 1.5;
-    }
-    const median = weightedQuantile(pairs, 0.5);
-    const q25 = weightedQuantile(pairs, 0.25);
-    const q75 = weightedQuantile(pairs, 0.75);
-    let sigma = Math.max(SIGMA_FLOOR, (q75 - q25) / 1.349);
-    const outside = Math.max(0, x0 - xmax, xmin - x0);
-    sigma = Math.min(SIGMA_CAP, sigma + EXTRAPOLATION_SPREAD * outside);
-    medians.push(median);
-    sigmas.push(sigma);
+function kernelWeights(
+  curves: LaunchCurve[],
+  x0: number,
+  bw0: number[],
+  startBw: number,
+): number[] {
+  let bw = startBw;
+  let ws: number[] = [];
+  for (let attempt = 0; attempt < 8; attempt++) {
+    ws = curves.map((c, i) => bw0[i] * Math.exp(-0.5 * ((Math.log10(c.v1) - x0) / bw) ** 2));
+    if (effectiveN(ws) >= MIN_EFFECTIVE_N || bw > 3) break;
+    bw *= 1.5;
   }
+  return ws;
+}
 
-  // Light smoothing of the median curve across neighbouring hours.
-  const smoothed = medians.map((m, i) => {
+/** Light smoothing of a per-hour curve across neighbouring hours. */
+function smoothCurve(values: number[]): number[] {
+  return values.map((m, i) => {
     let sum = 0;
     let weight = 0;
     for (let k = -1; k <= 1; k++) {
       const j = i + k;
-      if (j >= 0 && j < medians.length) {
+      if (j >= 0 && j < values.length) {
         const w = k === 0 ? 1 : SMOOTH_WEIGHT;
-        sum += medians[j] * w;
+        sum += values[j] * w;
         weight += w;
       }
     }
     return sum / weight;
   });
+}
 
-  return smoothed.map((m, i) => {
-    const hour = i + 2;
+/** Turn per-hour median log-ratios + sigmas into quantile rows. */
+function rowsFromCenters(
+  p1: number,
+  centers: number[],
+  sigmas: number[],
+  z: number[],
+): Array<{ hour: number; q: number[] }> {
+  return centers.map((m, i) => {
     const q = z.map((zi) => Math.max(1, round2(p1 * Math.exp(m + zi * sigmas[i]))));
-    // Quantiles are non-decreasing by construction (z increasing, sigma > 0);
-    // enforce it explicitly so a rounding edge can never break the shape.
     for (let j = 1; j < q.length; j++) q[j] = Math.max(q[j], q[j - 1]);
-    return { hour, q };
+    return { hour: i + 2, q };
   });
+}
+
+/**
+ * Estimator 1 — local linear. For each hour, a kernel-weighted least
+ * squares fit of log-ratio on (log10 hour-1 viewers − target), evaluated
+ * at the target. The intercept is re-centred on the weighted mean so a
+ * capped slope cannot shift the level, and a curvature correction adds
+ * back the bias a local-linear fit incurs on a convex curve (half the
+ * global quadratic coefficient times the window's weighted variance of
+ * log-size). Spread = weighted residual SD around the local fit, floored,
+ * capped, widened outside the training range, and scaled by SIGMA_SCALE.
+ */
+function localLinearForecast(
+  p1: number,
+  curves: LaunchCurve[],
+  targetConsoleOnly: boolean | null,
+  z: number[],
+): Array<{ hour: number; q: number[] }> {
+  const x0 = Math.log10(Math.max(1, p1));
+  const xs = curves.map((c) => Math.log10(c.v1));
+  const xmin = Math.min(...xs);
+  const xmax = Math.max(...xs);
+  const bw0 = baseWeights(curves, targetConsoleOnly);
+  const outside = Math.max(0, x0 - xmax, xmin - x0);
+  const centers: number[] = [];
+  const sigmas: number[] = [];
+
+  for (let h = 2; h <= 24; h++) {
+    // Global quadratic curvature for this hour (all curves, base weights).
+    let curvature = 0;
+    {
+      const rows: number[][] = [];
+      const ys: number[] = [];
+      const ws: number[] = [];
+      curves.forEach((c, i) => {
+        const y = c.logRatios[h - 2];
+        if (y === null) return;
+        const dx = Math.log10(c.v1) - x0;
+        rows.push([1, dx, dx * dx]);
+        ys.push(y);
+        ws.push(bw0[i]);
+      });
+      if (rows.length >= 3) {
+        const beta = weightedLeastSquares(rows, ys, ws);
+        if (beta) curvature = beta[2];
+      }
+    }
+
+    const ws = kernelWeights(curves, x0, bw0, BANDWIDTH);
+    const idx = curves.map((c, i) => i).filter((i) => curves[i].logRatios[h - 2] !== null);
+    const rows = idx.map((i) => [1, Math.log10(curves[i].v1) - x0]);
+    const ys = idx.map((i) => curves[i].logRatios[h - 2] as number);
+    const wsv = idx.map((i) => ws[i]);
+    const beta = weightedLeastSquares(rows, ys, wsv);
+    const sw = wsv.reduce((s, w) => s + w, 0);
+    const my = ys.reduce((s, y, j) => s + wsv[j] * y, 0) / Math.max(sw, 1e-12);
+    const mx = idx.reduce((s, i, j) => s + wsv[j] * (Math.log10(curves[i].v1) - x0), 0) / Math.max(sw, 1e-12);
+    let slope = beta ? beta[1] : 0;
+    slope = Math.max(-SLOPE_CAP, Math.min(SLOPE_CAP, slope));
+    // Re-centre the intercept on the weighted mean, so capping the slope
+    // cannot shift the fitted level.
+    let a = my - slope * mx;
+    if (curvature !== 0) {
+      const vx =
+        idx.reduce((s, i, j) => s + wsv[j] * (Math.log10(curves[i].v1) - x0 - mx) ** 2, 0) / Math.max(sw, 1e-12);
+      a += curvature * vx * 0.5;
+    }
+    // Weighted residual SD around the local fit.
+    const swR = wsv.reduce((s, w) => s + w, 0);
+    const varR =
+      idx.reduce((s, i, j) => {
+        const dx = Math.log10(curves[i].v1) - x0;
+        return s + wsv[j] * (ys[j] - (a + slope * dx)) ** 2;
+      }, 0) / Math.max(swR, 1e-12);
+    const sigma = Math.min(SIGMA_CAP, Math.max(SIGMA_FLOOR, Math.sqrt(varR)) + EXTRAPOLATION_SPREAD * outside);
+    centers.push(a);
+    sigmas.push(sigma * SIGMA_SCALE);
+  }
+
+  return rowsFromCenters(p1, smoothCurve(centers), sigmas, z);
+}
+
+/**
+ * Estimator 2 — peak + shape. The evening peak ratio is fitted by the same
+ * local-linear machinery; each hour's offset below the peak (log-ratio
+ * minus peak ratio) is a kernel-weighted median across launches, which
+ * keeps the coherent daily shape. Spread combines the peak uncertainty
+ * and the shape IQR in quadrature, then the same floor/cap/scale.
+ */
+function peakShapeForecast(
+  p1: number,
+  curves: LaunchCurve[],
+  targetConsoleOnly: boolean | null,
+  z: number[],
+): Array<{ hour: number; q: number[] }> {
+  const x0 = Math.log10(Math.max(1, p1));
+  const xs = curves.map((c) => Math.log10(c.v1));
+  const xmin = Math.min(...xs);
+  const xmax = Math.max(...xs);
+  const bw0 = baseWeights(curves, targetConsoleOnly);
+  const outside = Math.max(0, x0 - xmax, xmin - x0);
+  const ws = kernelWeights(curves, x0, bw0, BANDWIDTH);
+
+  const withPeak = curves.map((c, i) => i).filter((i) => curves[i].peak !== null);
+  const rows = withPeak.map((i) => [1, Math.log10(curves[i].v1) - x0]);
+  const peaks = withPeak.map((i) => curves[i].peak as number);
+  const wsv = withPeak.map((i) => ws[i]);
+  const beta = weightedLeastSquares(rows, peaks, wsv);
+  const sw = wsv.reduce((s, w) => s + w, 0);
+  const my = peaks.reduce((s, y, j) => s + wsv[j] * y, 0) / Math.max(sw, 1e-12);
+  const mx = withPeak.reduce((s, i, j) => s + wsv[j] * (Math.log10(curves[i].v1) - x0), 0) / Math.max(sw, 1e-12);
+  let peakSlope = beta ? beta[1] : 0;
+  peakSlope = Math.max(-SLOPE_CAP, Math.min(SLOPE_CAP, peakSlope));
+  const peakA = my - peakSlope * mx;
+  const peakVar =
+    withPeak.reduce((s, i, j) => {
+      const dx = Math.log10(curves[i].v1) - x0;
+      return s + wsv[j] * (peaks[j] - (peakA + peakSlope * dx)) ** 2;
+    }, 0) / Math.max(sw, 1e-12);
+  const peakSigma = Math.sqrt(peakVar);
+
+  const centers: number[] = [];
+  const sigmas: number[] = [];
+  for (let h = 2; h <= 24; h++) {
+    const pairs = curves.map(
+      (c, i) => [c.logRatios[h - 2] === null || c.peak === null ? null : (c.logRatios[h - 2] as number) - (c.peak as number), ws[i]] as [number | null, number],
+    );
+    const med = weightedQuantile(pairs, 0.5);
+    const q25 = weightedQuantile(pairs, 0.25);
+    const q75 = weightedQuantile(pairs, 0.75);
+    const shapeSigma = Math.max(0.1, (q75 - q25) / 1.349);
+    const sigma = Math.min(
+      SIGMA_CAP,
+      Math.sqrt(peakSigma ** 2 + shapeSigma ** 2) + EXTRAPOLATION_SPREAD * outside,
+    );
+    centers.push(peakA + med);
+    sigmas.push(sigma * SIGMA_SCALE);
+  }
+
+  return rowsFromCenters(p1, smoothCurve(centers), sigmas, z);
+}
+
+/**
+ * Blend two forecasts' quantiles in log space (geometric mean), so the
+ * ensemble median is the geometric mean of the two medians and the
+ * spreads average rather than compound.
+ */
+function blendForecasts(
+  a: Array<{ hour: number; q: number[] }>,
+  b: Array<{ hour: number; q: number[] }>,
+  weightA: number,
+): Array<{ hour: number; q: number[] }> {
+  return a.map((row, i) => {
+    const q = row.q.map((qa, j) => {
+      const v = Math.exp(weightA * Math.log(Math.max(1e-9, qa)) + (1 - weightA) * Math.log(Math.max(1e-9, b[i].q[j])));
+      return Math.max(1, round2(v));
+    });
+    for (let j = 1; j < q.length; j++) q[j] = Math.max(q[j], q[j - 1]);
+    return { hour: row.hour, q };
+  });
+}
+
+/** The house baseline: persistence with a widening random-walk spread. */
+function baselineQuantiles(p1: number, hour: number, z: number[]): number[] {
+  return z.map((zi) => Math.max(1, round2(p1 * Math.exp(zi * FALLBACK_SIGMA * Math.sqrt(hour - 1)))));
 }
 
 /** Forecast one case, falling back to persistence if anything is unusable. */
@@ -288,7 +509,9 @@ function forecastCase(c: CaseFile): { hours: Array<{ hour: number; q: number[] }
     if (curves.length >= 5) {
       const name = (c.game && c.game.name) || '';
       const targetConsoleOnly = CONSOLE_ONLY_NAMES.some((n) => name.includes(n)) ? true : null;
-      const rows = kernelForecast(p1, curves, targetConsoleOnly, z);
+      const local = localLinearForecast(p1, curves, targetConsoleOnly, z);
+      const peakShape = peakShapeForecast(p1, curves, targetConsoleOnly, z);
+      const rows = blendForecasts(local, peakShape, LOCAL_LINEAR_WEIGHT);
       const byHour = new Map(rows.map((r) => [r.hour, r.q]));
       return { hours: hours.map((h) => ({ hour: h, q: byHour.get(h) ?? baselineQuantiles(p1, h, z) })) };
     }
