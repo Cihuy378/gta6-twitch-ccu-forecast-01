@@ -31,6 +31,22 @@ GTA VI is console-only (PS5 + Xbox Series X|S), as are all four practice
 launches, so comparables whose console-only status matches the target's keep
 full weight and the others are down-weighted to 0.4.
 
+**Contaminated launches are halved, not trusted.** Each comparable carries a
+Tier annotation in its unlock note. Nine launches are
+`early-access-contaminated` — they peaked days before their standard release
+day, so their release-day curves are flat and drag a clean launch's median
+down — and two are `weak` analogues (free-to-play / slow-burn). Those
+eleven are down-weighted to 0.5; the 26 clean comparables keep full weight.
+The weight is read from the case file at run time, never hard-coded per
+game, and an unannotated comparable is treated as clean. This is the one
+revision after the first build: it fixes the diagnosis that the forecast's
+median sat systematically low in the evening (the 50% quantile was breached
+only 22% of the time on practice). Validated on the target-like subsets —
+practice, leave-one-out over clean launches, and over clean big launches —
+it improves all three, while leave-one-out over all 37 launches is
+unchanged (0.385 → 0.386); it only scores worse on contaminated targets,
+whose flat release days a clean-shape model is *supposed* to overshoot.
+
 **Honest spreads.** The spread is the local interquartile range of the same
 kernel weights (σ = IQR / 1.349, floored at 0.25, capped at 1.4), plus 0.15
 per dex the target's hour 1 sits outside the training range — an unusually
@@ -55,16 +71,20 @@ loss on the log scale over every hour and quantile, lower is better.
 |---|---|---|---|
 | House baseline (starter) | 0.387 | 0.930 | 0.261 |
 | Global median curve | 0.310 | 0.793 | 0.346 |
-| **This entry (kernel + platform)** | **0.216** | **0.385** | **0.215** |
+| First build (kernel + platform) | 0.216 | 0.385 | 0.215 |
+| **This entry (kernel + platform + tier weight)** | **0.209** | **0.386** | **0.190** |
 
-Per practice case, this entry: Wolverine 0.364, Red Dead Redemption 2 0.181,
-God of War Ragnarök 0.133, Spider-Man 2 0.186 (baseline: 0.744 / 0.287 /
-0.215 / 0.303). 90% coverage on practice is 0.92 (honest ≈ 0.9); typical
-median miss ≈ 51% vs the baseline's 90%.
+Per practice case, this entry: Wolverine 0.352, Red Dead Redemption 2 0.165,
+God of War Ragnarök 0.139, Spider-Man 2 0.182 (baseline: 0.744 / 0.287 /
+0.215 / 0.303). 90% coverage on practice is 0.89 (honest ≈ 0.9); typical
+median miss ≈ 40% vs the baseline's 90%. On the target-like subsets the
+revision also helps: leave-one-out over clean launches 0.442 → 0.434, over
+clean big launches 0.210 → 0.190, over clean console-only launches
+0.195 → 0.188.
 
 Sanity check on the final's shape: if GTA VI's hour 1 prints 500,000
-viewers, the entry forecasts a median dip to ~0.50× by hour 10, rising to a
-~1.32× evening peak at hour 20 (median ≈ 658k, 90% interval ≈ 261k–1.66M),
+viewers, the entry forecasts a median dip to ~0.53× by hour 10, rising to a
+~1.32× evening peak at hour 20 (median ≈ 658k, 90% interval ≈ 230k–1.88M),
 and ~1.17× at hour 24. A 1,000,000 hour 1 flattens the day further (peak
 ≈ 1.19×) — the saturation the kernel learns from Elden Ring and Cyberpunk.
 

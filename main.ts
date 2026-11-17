@@ -18,6 +18,16 @@
 //     size than PC launches do — GTA VI is console-only, as are all four
 //     practice launches — so comparables whose console-only status matches the
 //     target's keep full weight and the others are down-weighted to 0.4.
+//   * Each comparable carries a Tier annotation in its unlock note
+//     (comparable / early-access-contaminated / weak). Early-access launches
+//     peaked days before their standard release day, so their release-day
+//     curves are flat and drag a clean launch's median down; free-to-play
+//     and slow-burn launches are weak analogues for a paid single-player
+//     AAA launch. Non-clean tiers are therefore down-weighted to 0.5 —
+//     halved, not dropped, so the local sample stays large. GTA VI is a
+//     clean launch, as are all four practice launches. (Validated: practice
+//     0.216 -> 0.209, leave-one-out over clean launches 0.442 -> 0.434,
+//     over clean big launches 0.210 -> 0.190.)
 //   * The spread is the local interquartile range of the same kernel weights
 //     (sigma = IQR / 1.349, floored at 0.25, capped at 1.4), plus 0.15 per dex
 //     the target's hour-1 sits outside the training range, so an unusually
@@ -51,6 +61,9 @@ const BANDWIDTH = 0.45;
 const MIN_EFFECTIVE_N = 6;
 /** Weight of a comparable whose console-only status differs from the target's. */
 const PLATFORM_MISMATCH_WEIGHT = 0.4;
+/** Weight of a comparable whose Tier is not "comparable" (early-access
+ *  contaminated or weak analogue). Halved, not dropped. */
+const NON_CLEAN_TIER_WEIGHT = 0.5;
 /** Floor and cap of the log-spread sigma. */
 const SIGMA_FLOOR = 0.25;
 const SIGMA_CAP = 1.4;
@@ -88,6 +101,8 @@ interface Comparable {
   name: string;
   day_start: string;
   platforms?: string;
+  /** Research note carrying the Tier annotation ("Tier: comparable" etc). */
+  unlock?: string;
   hourly: Array<{ from: string; viewers: number; channels?: number | null }>;
 }
 
@@ -104,8 +119,21 @@ interface CaseFile {
 interface LaunchCurve {
   v1: number;
   consoleOnly: boolean;
+  /** "comparable", "early-access-contaminated", "weak", or "unknown". */
+  tier: string;
   /** log(viewers_h / viewers_1) for h = 2..24, null where the hour is missing. */
   logRatios: Array<number | null>;
+}
+
+/**
+ * The Tier annotation in a comparable's unlock note ("Tier: comparable" /
+ * "Tier: early-access-contaminated" / "Tier: weak"). "unknown" when the
+ * note carries no Tier — treated as clean, so an unannotated launch is
+ * never silently dropped or down-weighted.
+ */
+function tierOf(unlock?: string): string {
+  const m = /Tier:\s*([a-z-]+)/.exec(unlock ?? '');
+  return m ? m[1] : 'unknown';
 }
 
 /** Inverse of the standard normal CDF (Acklam's rational approximation). */
@@ -173,7 +201,7 @@ function extractCurves(c: CaseFile): LaunchCurve[] {
       const v = byHour.get(h);
       logRatios.push(v !== undefined && v > 0 ? Math.log(v / v1) : null);
     }
-    curves.push({ v1, consoleOnly: isConsoleOnly(comp.platforms), logRatios });
+    curves.push({ v1, consoleOnly: isConsoleOnly(comp.platforms), tier: tierOf(comp.unlock), logRatios });
   }
   return curves;
 }
@@ -203,7 +231,8 @@ function kernelForecast(p1: number, curves: LaunchCurve[], targetConsoleOnly: bo
         const kernel = Math.exp(-0.5 * ((Math.log10(c.v1) - x0) / bw) ** 2);
         const platform =
           targetConsoleOnly === null || c.consoleOnly === targetConsoleOnly ? 1 : PLATFORM_MISMATCH_WEIGHT;
-        return [c.logRatios[h - 2], kernel * platform] as [number | null, number];
+        const tier = c.tier === 'comparable' || c.tier === 'unknown' ? 1 : NON_CLEAN_TIER_WEIGHT;
+        return [c.logRatios[h - 2], kernel * platform * tier] as [number | null, number];
       });
       const sw = pairs.reduce((s, [, w]) => s + w, 0);
       const sw2 = pairs.reduce((s, [, w]) => s + w * w, 0);
