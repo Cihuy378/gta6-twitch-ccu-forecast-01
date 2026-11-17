@@ -58,6 +58,25 @@
 //       are left alone: the bias there has no consistent sign across
 //       launches, so a shift would be a coin flip.
 //
+// Round-4 changes (validated the same way — see README.md):
+//   (d) EARLY-HOUR DOWNWARD SHIFT. Hours 2-4 are systematically
+//       OVER-predicted for console-only targets — on practice (mean
+//       log-error -0.11 to -0.13) and on leave-one-out big console-only
+//       launches (-0.08, -0.14, -0.21) alike — so a uniform -0.12 log-unit
+//       shift at hours 2-4, console-only only, corrects it. Multiplatform
+//       launches show no such bias there, so the shift is gated.
+//   (e) SIZE-DEPENDENT UPPER-TAIL SIGMA. The 95% quantile is breached
+//       99% of the time on practice (want 95%): the upper tail is too
+//       wide for big console-only targets. Mirroring (b), the sigma above
+//       the median is scaled down smoothly from 1.0 at small sizes to
+//       0.75 at huge ones, console-only only. (The lower-tail threshold
+//       also moves from log10 5.0 to 4.25: the lower tail tightens a
+//       little earlier, which the 25% quantile's 0.16 breach rate asks
+//       for; at huge target sizes the two thresholds nearly agree.)
+//   (f) MEDIAN SHIFT 0.14 -> 0.15. The console-only shift grows by 0.01:
+//       the median breach rate stays 0.52 (calibrated), and the extra
+//       hundredth buys practice loss on every case but Spider-Man 2.
+//
 // Anchor: the case's hour-1 print p1. Every other hour is forecast as a
 // log-ratio to p1, so the forecast scales with whatever launch day turns
 // out to be and the log-scale pinball loss is scale-free. The median curve
@@ -100,10 +119,28 @@ const SIGMA_SCALE = 0.7;
  *  launches have a much tighter lower tail than small ones. */
 const SIGMA_LO_BIG_SCALE = 0.7;
 /** log10(hour-1 viewers) at which the lower-tail scale is halfway from 1.0
- *  down to SIGMA_LO_BIG_SCALE. */
-const SIGMA_LO_THRESHOLD = 5;
-/** Upward log-shift applied to console-only targets (round-3 (c)). */
-const MEDIAN_SHIFT = 0.14;
+ *  down to SIGMA_LO_BIG_SCALE. Round 4 moves this from 5.0 to 4.25: the
+ *  lower tail tightens a little earlier (the 25% quantile's 0.16 breach
+ *  rate asks for it); at huge target sizes the two thresholds nearly agree. */
+const SIGMA_LO_THRESHOLD = 4.25;
+/** Upper-tail sigma scale for very large targets (round-4 (e)): the 95%
+ *  quantile is breached 99% of the time on practice (want 95%), so the
+ *  sigma above the median is scaled down for big console-only targets,
+ *  mirroring the lower-tail scale. */
+const SIGMA_HI_BIG_SCALE = 0.75;
+/** log10(hour-1 viewers) at which the upper-tail scale is halfway from 1.0
+ *  down to SIGMA_HI_BIG_SCALE. */
+const SIGMA_HI_THRESHOLD = 5;
+/** Upward log-shift applied to console-only targets (round-3 (c), round-4
+ *  (f) raises it from 0.14 to 0.15: the median breach rate stays 0.52,
+ *  calibrated). */
+const MEDIAN_SHIFT = 0.15;
+/** Downward log-shift applied to console-only targets at hours 2-4
+ *  (round-4 (d)): those hours are systematically over-predicted for
+ *  console-only targets, on practice and on leave-one-out big
+ *  console-only launches alike. Uniform across quantiles (a pure
+ *  location correction). */
+const EARLY_SHIFT = -0.12;
 /** Per-quantile multipliers of MEDIAN_SHIFT, in level order
  *  (5%, 25%, 50%, 75%, 95%): the 25% quantile is the most miscalibrated
  *  (breached only 14% of the time at round 2), the 95% is already fine. */
@@ -360,11 +397,25 @@ function lowerTailScale(x0: number): number {
   return 1 - (1 - SIGMA_LO_BIG_SCALE) / (1 + Math.exp(-(x0 - SIGMA_LO_THRESHOLD) / 0.5));
 }
 
+/** Upper-tail sigma scale for a target of log10 hour-1 size x0 (round-4
+ *  (e)): 1.0 for small launches, SIGMA_HI_BIG_SCALE for huge ones, smooth
+ *  in between (sigmoid, width 0.5 dex). Mirrors lowerTailScale. */
+function upperTailScale(x0: number): number {
+  return 1 - (1 - SIGMA_HI_BIG_SCALE) / (1 + Math.exp(-(x0 - SIGMA_HI_THRESHOLD) / 0.5));
+}
+
 /** Hours where the console-only median shift applies (round-3 (c)): the
  *  morning dip (5-9) and the evening peak (17-24). Hours 2-4 and 10-16
  *  are left alone — no consistent bias sign there. */
 function shiftApplies(hour: number): boolean {
   return (hour >= 5 && hour <= 9) || hour >= 17;
+}
+
+/** Hours where the console-only early downward shift applies (round-4
+ *  (d)): hours 2-4, systematically over-predicted for console-only
+ *  targets. */
+function earlyShiftApplies(hour: number): boolean {
+  return hour >= 2 && hour <= 4;
 }
 
 /** Turn per-hour median log-ratios + sigmas into quantile rows. The sigma
@@ -567,6 +618,53 @@ function applyMedianShift(
   });
 }
 
+/**
+ * Console-only upper-tail tightening (round-4 (e)): for console-only
+ * targets, shrink the log-spread above the median by upperTailScale(x0)
+ * — q'_j = median * (q_j / median)^k for the quantiles above the median
+ * — at every hour. The lower quantiles pass through untouched (their
+ * scale already lives inside the forecasters). Applied post-blend, so it
+ * acts on the ensemble's quantiles exactly as validated. Non-console-only
+ * targets pass through untouched.
+ */
+function applyUpperTailScale(
+  rows: Array<{ hour: number; q: number[] }>,
+  p1: number,
+  targetConsoleOnly: boolean | null,
+): Array<{ hour: number; q: number[] }> {
+  if (targetConsoleOnly !== true) return rows;
+  const k = upperTailScale(Math.log10(Math.max(1, p1)));
+  if (k >= 1) return rows;
+  return rows.map((row) => {
+    const med = row.q[2];
+    const q = row.q.map((v, j) =>
+      j <= 2 ? v : Math.max(1, round2(med * Math.pow(Math.max(v, 1e-9) / med, k))),
+    );
+    for (let j = 1; j < q.length; j++) q[j] = Math.max(q[j], q[j - 1]);
+    return { hour: row.hour, q };
+  });
+}
+
+/**
+ * Console-only early downward shift (round-4 (d)): for console-only
+ * targets, shift every quantile down by EARLY_SHIFT log units at hours
+ * 2-4, where the forecast is systematically too high. Uniform across
+ * quantiles (a pure location correction). Non-console-only targets pass
+ * through untouched.
+ */
+function applyEarlyShift(
+  rows: Array<{ hour: number; q: number[] }>,
+  targetConsoleOnly: boolean | null,
+): Array<{ hour: number; q: number[] }> {
+  if (targetConsoleOnly !== true) return rows;
+  return rows.map((row) => {
+    if (!earlyShiftApplies(row.hour)) return row;
+    const q = row.q.map((v) => Math.max(1, round2(v * Math.exp(EARLY_SHIFT))));
+    for (let j = 1; j < q.length; j++) q[j] = Math.max(q[j], q[j - 1]);
+    return { hour: row.hour, q };
+  });
+}
+
 /** The house baseline: persistence with a widening random-walk spread. */
 function baselineQuantiles(p1: number, hour: number, z: number[]): number[] {
   return z.map((zi) => Math.max(1, round2(p1 * Math.exp(zi * FALLBACK_SIGMA * Math.sqrt(hour - 1)))));
@@ -587,8 +685,16 @@ function forecastCase(c: CaseFile): { hours: Array<{ hour: number; q: number[] }
       const targetConsoleOnly = CONSOLE_ONLY_NAMES.some((n) => name.includes(n)) ? true : null;
       const local = localLinearForecast(p1, curves, targetConsoleOnly, z);
       const peakShape = peakShapeForecast(p1, curves, targetConsoleOnly, z);
-      const rows = applyMedianShift(
-        blendForecasts(local, peakShape, LOCAL_LINEAR_WEIGHT),
+      const blended = blendForecasts(local, peakShape, LOCAL_LINEAR_WEIGHT);
+      // Post-blend corrections, in the order validated: upper-tail
+      // tightening, then the console-only median shift, then the
+      // early-hour downward shift (the two shifts touch disjoint hours,
+      // so their order between themselves does not matter).
+      const rows = applyEarlyShift(
+        applyMedianShift(
+          applyUpperTailScale(blended, p1, targetConsoleOnly),
+          targetConsoleOnly,
+        ),
         targetConsoleOnly,
       );
       const byHour = new Map(rows.map((r) => [r.hour, r.q]));
