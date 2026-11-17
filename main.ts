@@ -37,6 +37,27 @@
 // down-weighted to 0.25; halving was not enough, the contaminated launches
 // peak days before release day and drag the evening down).
 //
+// Round-3 changes (validated the same way — see README.md):
+//   (a) NO median smoothing. Smoothing blurs the hour-5 US-unlock jump and
+//       the evening peak, both sharp features the per-hour fits get right;
+//       removing it improves practice and the big-launch guardrails.
+//   (b) SIZE-DEPENDENT LOWER-TAIL SIGMA. Big launches have a much tighter
+//       lower tail than small ones (leave-one-out evening error SD 0.33 for
+//       v1 > 100k vs 0.96 for v1 < 10k), so the sigma below the median is
+//       scaled down for big targets (smoothly, from 1.0 at small sizes to
+//       0.7 at huge ones). The upper tail is untouched.
+//   (c) CONSOLE-ONLY MEDIAN SHIFT. For console-only targets the forecast
+//       is systematically too low in the morning dip (hours 5-9) and the
+//       evening peak (hours 17-24): the practice cases and the big
+//       console-only leave-one-out launches all peak above the pooled fit
+//       (the pooled fit is dominated by multiplatform launches, which peak
+//       lower at big sizes). A tapered upward shift (+0.14 log units on the
+//       5% and 50% quantiles, +0.175 on the 25% — the most miscalibrated —
+//       +0.07 on the 75%, none on the 95%) corrects it, applied only at
+//       those hours and only for console-only targets. Hours 2-4 and 10-16
+//       are left alone: the bias there has no consistent sign across
+//       launches, so a shift would be a coin flip.
+//
 // Anchor: the case's hour-1 print p1. Every other hour is forecast as a
 // log-ratio to p1, so the forecast scales with whatever launch day turns
 // out to be and the log-scale pinball loss is scale-free. The median curve
@@ -75,10 +96,25 @@ const SIGMA_CAP = 1.4;
 /** Scale applied to every sigma: the raw residual SD overstates the
  *  conditional spread; 0.7 minimises pinball loss on practice + LOO. */
 const SIGMA_SCALE = 0.7;
+/** Lower-tail sigma scale for very large targets (round-3 (b)): big
+ *  launches have a much tighter lower tail than small ones. */
+const SIGMA_LO_BIG_SCALE = 0.7;
+/** log10(hour-1 viewers) at which the lower-tail scale is halfway from 1.0
+ *  down to SIGMA_LO_BIG_SCALE. */
+const SIGMA_LO_THRESHOLD = 5;
+/** Upward log-shift applied to console-only targets (round-3 (c)). */
+const MEDIAN_SHIFT = 0.14;
+/** Per-quantile multipliers of MEDIAN_SHIFT, in level order
+ *  (5%, 25%, 50%, 75%, 95%): the 25% quantile is the most miscalibrated
+ *  (breached only 14% of the time at round 2), the 95% is already fine. */
+const MEDIAN_SHIFT_TAPER = [1, 1.25, 1, 0.5, 0];
 /** Extra spread per dex the target sits outside the training range. */
 const EXTRAPOLATION_SPREAD = 0.15;
-/** Weight of a neighbouring hour when smoothing the median curve. */
-const SMOOTH_WEIGHT = 0.5;
+/** Weight of a neighbouring hour when smoothing the median curve.
+ *  Round 3 sets this to 0 (no smoothing): smoothing blurs the hour-5
+ *  unlock jump and the evening peak, and removing it improves practice
+ *  and the big-launch guardrails. */
+const SMOOTH_WEIGHT = 0;
 /** Cap on the fitted size slope (per dex), to bound extrapolation. */
 const SLOPE_CAP = 3;
 /** Blend weight of the local-linear estimator (peak+shape gets the rest). */
@@ -317,15 +353,32 @@ function smoothCurve(values: number[]): number[] {
   });
 }
 
-/** Turn per-hour median log-ratios + sigmas into quantile rows. */
+/** Lower-tail sigma scale for a target of log10 hour-1 size x0 (round-3
+ *  (b)): 1.0 for small launches, SIGMA_LO_BIG_SCALE for huge ones, smooth
+ *  in between (sigmoid, width 0.5 dex). */
+function lowerTailScale(x0: number): number {
+  return 1 - (1 - SIGMA_LO_BIG_SCALE) / (1 + Math.exp(-(x0 - SIGMA_LO_THRESHOLD) / 0.5));
+}
+
+/** Hours where the console-only median shift applies (round-3 (c)): the
+ *  morning dip (5-9) and the evening peak (17-24). Hours 2-4 and 10-16
+ *  are left alone — no consistent bias sign there. */
+function shiftApplies(hour: number): boolean {
+  return (hour >= 5 && hour <= 9) || hour >= 17;
+}
+
+/** Turn per-hour median log-ratios + sigmas into quantile rows. The sigma
+ *  below the median is scaled by sigLoScale (the size-dependent lower-tail
+ *  scale); the sigma above the median is used as-is. */
 function rowsFromCenters(
   p1: number,
   centers: number[],
   sigmas: number[],
   z: number[],
+  sigLoScale = 1,
 ): Array<{ hour: number; q: number[] }> {
   return centers.map((m, i) => {
-    const q = z.map((zi) => Math.max(1, round2(p1 * Math.exp(m + zi * sigmas[i]))));
+    const q = z.map((zi) => Math.max(1, round2(p1 * Math.exp(m + zi * sigmas[i] * (zi < 0 ? sigLoScale : 1)))));
     for (let j = 1; j < q.length; j++) q[j] = Math.max(q[j], q[j - 1]);
     return { hour: i + 2, q };
   });
@@ -408,7 +461,7 @@ function localLinearForecast(
     sigmas.push(sigma * SIGMA_SCALE);
   }
 
-  return rowsFromCenters(p1, smoothCurve(centers), sigmas, z);
+  return rowsFromCenters(p1, smoothCurve(centers), sigmas, z, lowerTailScale(x0));
 }
 
 /**
@@ -468,7 +521,7 @@ function peakShapeForecast(
     sigmas.push(sigma * SIGMA_SCALE);
   }
 
-  return rowsFromCenters(p1, smoothCurve(centers), sigmas, z);
+  return rowsFromCenters(p1, smoothCurve(centers), sigmas, z, lowerTailScale(x0));
 }
 
 /**
@@ -486,6 +539,29 @@ function blendForecasts(
       const v = Math.exp(weightA * Math.log(Math.max(1e-9, qa)) + (1 - weightA) * Math.log(Math.max(1e-9, b[i].q[j])));
       return Math.max(1, round2(v));
     });
+    for (let j = 1; j < q.length; j++) q[j] = Math.max(q[j], q[j - 1]);
+    return { hour: row.hour, q };
+  });
+}
+
+/**
+ * Console-only median shift (round-3 (c)): for console-only targets,
+ * raise the lower quantiles at the morning-dip and evening-peak hours,
+ * where the pooled fit is systematically too low. Monotonicity is
+ * re-enforced (the taper is not monotone in j: the 25% quantile gets
+ * the largest multiplier). Non-console-only targets pass through
+ * untouched.
+ */
+function applyMedianShift(
+  rows: Array<{ hour: number; q: number[] }>,
+  targetConsoleOnly: boolean | null,
+): Array<{ hour: number; q: number[] }> {
+  if (targetConsoleOnly !== true) return rows;
+  return rows.map((row) => {
+    if (!shiftApplies(row.hour)) return row;
+    const q = row.q.map((v, j) =>
+      Math.max(1, round2(v * Math.exp(MEDIAN_SHIFT * (MEDIAN_SHIFT_TAPER[j] ?? 0)))),
+    );
     for (let j = 1; j < q.length; j++) q[j] = Math.max(q[j], q[j - 1]);
     return { hour: row.hour, q };
   });
@@ -511,7 +587,10 @@ function forecastCase(c: CaseFile): { hours: Array<{ hour: number; q: number[] }
       const targetConsoleOnly = CONSOLE_ONLY_NAMES.some((n) => name.includes(n)) ? true : null;
       const local = localLinearForecast(p1, curves, targetConsoleOnly, z);
       const peakShape = peakShapeForecast(p1, curves, targetConsoleOnly, z);
-      const rows = blendForecasts(local, peakShape, LOCAL_LINEAR_WEIGHT);
+      const rows = applyMedianShift(
+        blendForecasts(local, peakShape, LOCAL_LINEAR_WEIGHT),
+        targetConsoleOnly,
+      );
       const byHour = new Map(rows.map((r) => [r.hour, r.q]));
       return { hours: hours.map((h) => ({ hour: h, q: byHour.get(h) ?? baselineQuantiles(p1, h, z) })) };
     }

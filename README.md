@@ -9,7 +9,7 @@ Twitch concurrent viewers in the "Grand Theft Auto VI" category. It runs
 offline — everything it knows is in the case file, including the 38–42 past
 launches shipped as `comparables`.
 
-## Method (round 2)
+## Method (round 3)
 
 **Anchor on hour 1.** Every hour is forecast as a log-ratio to the case's
 hour-1 print, so the forecast scales with whatever launch day turns out to be
@@ -69,7 +69,33 @@ the target's hour 1 sits outside the training range — then **scaled by
 0.7**. The raw residual SD overstates the conditional spread (it mixes
 launches far across the kernel window); 0.7 is the scale that minimises
 pinball loss on the practice cases and on leave-one-out big launches alike.
-The median curve is lightly smoothed across neighbouring hours (weight 0.5).
+Round 3 adds a **size-dependent lower-tail sigma**: big launches have a
+much tighter lower tail than small ones (leave-one-out evening error SD
+0.33 for hour-1 > 100k vs 0.96 below 10k), so the sigma below the median
+is scaled down smoothly from 1.0 at small sizes to 0.7 at huge ones.
+The upper tail is untouched.
+
+**No median smoothing.** Round 2 smoothed the median curve across
+neighbouring hours (weight 0.5). Round 3 removes it: smoothing blurs the
+hour-5 US-unlock jump and the evening peak, both sharp features the
+per-hour fits get right, and removing it improves practice and the
+big-launch guardrails.
+
+**Console-only median shift.** Round 2's forecast was systematically too
+low for console-only targets in the morning dip (hours 5–9) and the
+evening peak (hours 17–24): all four practice cases and all three big
+console-only leave-one-out launches peak above the pooled fit, which is
+dominated by multiplatform launches (at big sizes, console-only launches
+peak *higher* than multiplatform ones at the same hour-1 size — the
+opposite of the small-launch pattern). Round 3 corrects it with a tapered
+upward shift for console-only targets only: +0.14 log units on the 5%
+and 50% quantiles, +0.175 on the 25% (the most miscalibrated quantile —
+breached only 14% of the time at round 2), +0.07 on the 75%, none on the
+95%, applied only at hours 5–9 and 17–24. Hours 2–4 and 10–16 are left
+alone: the bias there has no consistent sign across launches (Spider-Man
+2's midday is over-predicted by up to +0.95, Red Dead 2's under-predicted
+by −0.26), so a shift there would be a coin flip. The shift is a
+post-blend correction, so it cannot disturb the ensemble's shape.
 
 **Fallbacks.** If a case ships fewer than 5 usable comparables, the program
 falls back to the house baseline (persistence with a widening random-walk
@@ -89,14 +115,20 @@ loss on the log scale over every hour and quantile, lower is better.
 | Round 1 (kernel median + tier 0.5) | 0.209 | 0.434 | 0.190 | 0.166 |
 | Round 2 local linear only | 0.151 | 0.426 | 0.179 | 0.128 |
 | Round 2 peak + shape only | 0.150 | 0.491 | 0.190 | 0.120 |
-| **Round 2 ensemble (this entry)** | **0.145** | **0.435** | **0.179** | **0.119** |
+| Round 2 ensemble | 0.145 | 0.435 | 0.179 | 0.119 |
+| **Round 3 ensemble (this entry)** | **0.122** | **0.444** | **0.175** | **0.102** |
 
-Per practice case, this entry: Wolverine 0.159, Red Dead Redemption 2
-0.151, God of War Ragnarök 0.100, Spider-Man 2 0.170 (round 1: 0.352 /
-0.165 / 0.139 / 0.182). 90% coverage on practice is 0.95; the median's mean
-absolute log-error is 0.23 (round 1: 0.32). The biggest single gain is
-Wolverine (0.352 → 0.159): the smallest practice launch, where the kernel
-median was most biased.
+Per practice case, this entry: Wolverine 0.132, Red Dead Redemption 2
+0.116, God of War Ragnarök 0.077, Spider-Man 2 0.164 (round 2: 0.159 /
+0.151 / 0.100 / 0.170). 90% coverage on practice is 0.95; the median's
+mean absolute log-error is 0.18 (round 2: 0.23). Per-quantile breach
+rates on practice are 0.04 / 0.18 / 0.52 / 0.77 / 0.99 for the 5% / 25% /
+50% / 75% / 95% quantiles (want 0.05 / 0.25 / 0.50 / 0.75 / 0.95) —
+the median is now calibrated, where round 2's was breached only 35% of
+the time. The biggest single gain over round 2 is Red Dead Redemption 2
+(0.151 → 0.116) and God of War Ragnarök (0.100 → 0.077), the two
+largest practice launches, where the console-only shift and the tighter
+lower tail both bite.
 
 Ideas tested and rejected (each measured on practice + the leave-one-out
 subsets): local quadratic fits (variance beats the curvature gain),
@@ -104,17 +136,28 @@ global quadratic fits, empirical residual quantiles instead of a normal
 spread, k-nearest-neighbour whole curves, unlock-hour alignment of the
 early hours, pre-launch diurnal profiles and pre-launch evening levels as
 extra features (correlations ≈ 0 with the size-removed peak residual),
-and lower-tail-only sigma tightening (helps practice, hurts leave-one-out).
-The final target is a huge clean console-only launch, so the
-leave-one-out clean-big and clean-big console-only subsets are the
-guardrails that matter — both improve over round 1, while leave-one-out
-over all clean launches is unchanged (0.434 → 0.435).
+uniform lower-tail-only sigma tightening (helps practice, hurts
+leave-one-out — round 3's *size-dependent* version, which only tightens
+for big targets, helps both), LAD and Huber median regression, quantile
+regression instead of the normal spread, a platform×size interaction
+model (helps small launches only, too noisy for big targets), hourly
+blend weights, a three-way console-only blend, a morning-only median
+shift (the evening shift carries most of the gain), a full-hours median
+shift (the midday bias has no consistent sign), and wider sigmas on top
+of the shift. The final target is a huge clean console-only launch, so
+the leave-one-out clean-big and clean-big console-only subsets are the
+guardrails that matter — both improve over round 2 (0.179 → 0.175 and
+0.119 → 0.102), while leave-one-out over all clean launches worsens
+slightly (0.435 → 0.444): the console-only shift is tuned for big
+launches and small console-only launches are already over-predicted, so
+the shift costs them. That trade is accepted — the final is a huge
+launch, not a small one.
 
 Sanity check on the final's shape: if GTA VI's hour 1 prints 500,000
-viewers, the entry forecasts a median dip to ~0.59× by hour 8, rising to a
-~1.16× evening peak at hour 18 (median ≈ 581k), and ~0.93× at hour 24. A
-1,500,000 hour 1 — beyond the largest comparable (Elden Ring, 875k) —
-flattens further (median peak ≈ 1.19M at hour 18, ~0.79× hour 1) with
+viewers, the entry forecasts a median dip to ~0.51× by hour 10, rising to
+a ~1.35× evening peak at hour 19 (median ≈ 675k), and ~1.11× at hour 24.
+A 1,500,000 hour 1 — beyond the largest comparable (Elden Ring, 875k) —
+flattens further (median peak ≈ 1.39M at hour 19, ~0.93× hour 1) with
 honestly wider quantiles from the extrapolation term: the saturation the
 local-linear fit learns from Elden Ring and Cyberpunk, extrapolated
 smoothly rather than clipped.
